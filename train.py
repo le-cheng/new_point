@@ -23,8 +23,8 @@ parser.add_argument('-c', '--config', default='configs/config.yaml', type=str, m
 parser.add_argument('--resume', default=None, type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--exp_name', default=None, type=str, metavar='PATH',
-                    help='exp_name')                    
-
+                    help='exp_name')     
+parser.add_argument('--seed', type=int, help='random seed')      
 
 def main():
     args = parser.parse_args()
@@ -67,16 +67,22 @@ def main():
     assert torch.cuda.is_available(), "Please ensure codes are executed in cuda."
     device = torch.device("cuda")
     logger.info(f'Using NO.{str(cfg.gpu)} device')
-    logger.info("There are {} gpus in total".format(torch.cuda.device_count()))
-    logger.info("Torch Version: {}".format(torch.__version__))
-    logger.info("Cuda Version: {}".format(torch.version.cuda))
-    assert torch.backends.cudnn.enabled, "Amp requires cudnn backend to be enabled."
-    logger.info("Cudnn Version: {}".format(torch.backends.cudnn.version()))
-    # logger.info(f'World_size:{str(get_world_size())}')
+    # logger.info("There are {} gpus in total".format(torch.cuda.device_count()))
+    # logger.info("Torch Version: {}".format(torch.__version__))
+    # logger.info("Cuda Version: {}".format(torch.version.cuda))
+    # assert torch.backends.cudnn.enabled, "Amp requires cudnn backend to be enabled."
+    # logger.info("Cudnn Version: {}".format(torch.backends.cudnn.version()))
+    logger.info("use Model: [ {} ]".format(cfg.model_name))
+    logger.info("use Data: [ {} ]".format(cfg.data_name))
+    logger.info("data class number: [ {} ]".format(cfg.num_class))
     
     '''init'''
-    seed = torch.randint(1, 10000,(1,))
-    seed = 9523
+    if args.seed is not None:
+        seed = args.seed
+    else:
+        seed = torch.randint(1, 10000,(1,))
+    
+    # seed = 9523
     logger.info("Seed: [ {} ]".format(seed))
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -166,17 +172,18 @@ def main():
         logger.info('Test Accuracy: %f, Class Accuracy: %f, Best: [%f]'% (test_acc, class_acc, best_test_acc))
         # logger.info('Best Accuracy: [%f], Class Accuracy: [%f]'% (best_test_acc, best_class_acc))   
         if (test_acc >= best_test_acc):
-            best_epoch = epoch + 1
-            savepath = root_dir+'/best_model.pth'
-            logger.info('Save model..., Saving at %s'% savepath)
-            state = {
-                'epoch': best_epoch,
-                'instance_acc': test_acc,
-                'class_acc': class_acc,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            torch.save(state, savepath)
+            if (test_acc >= 0.7):
+                best_epoch = epoch + 1
+                savepath = root_dir+'/best_model.pth'
+                logger.info('Save model..., Saving at %s'% savepath)
+                state = {
+                    'epoch': best_epoch,
+                    'instance_acc': test_acc,
+                    'class_acc': class_acc,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }
+                torch.save(state, savepath)
 
         writer.add_scalar('Test_Acc', test_acc, epoch)
         writer.add_scalar('Best_Acc', best_test_acc, epoch)

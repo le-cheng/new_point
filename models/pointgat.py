@@ -1,5 +1,5 @@
 """
-SGPool替换
+resconv3.16
 """
 import os
 import torch
@@ -113,7 +113,6 @@ def sample_and_group(npoint, radius, nsample, xyz, points, knn=True):
         groupe_idx = query_ball_point(radius, nsample, xyz, new_xyz)
     new_grouped_points = index_points(points, groupe_idx) # [B, npoint, nsample, D]
     return new_xyz, new_grouped_points, groupe_idx
-
 def get_act(activation):
     if activation.lower() == 'gelu':
         return nn.GELU()
@@ -129,7 +128,6 @@ def get_act(activation):
         return nn.LeakyReLU(negative_slope=0.1, inplace=True)
     else:
         return nn.ReLU(inplace=True)
-
 class Conv1dBR(nn.Module):
     def __init__(self, in_channels, out_channels, bias=True, activation='leakyrelu'):
         super(Conv1dBR, self).__init__()
@@ -146,7 +144,6 @@ class Conv1dBR(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
-
 class LinearBR(nn.Module):
     def __init__(self, in_channels, out_channels, bias=True, activation='leakyrelu', Dropout=True):
         super(Conv1dBR, self).__init__()
@@ -171,7 +168,6 @@ class LinearBR(nn.Module):
         else:
             self.layers(x)
         return x       
-
 class ResConv1dBR(nn.Module):
     def __init__(self, in_channels, res_expansion=1.0, bias=False, activation='relu'):
         super(ResConv1dBR, self).__init__()
@@ -180,68 +176,57 @@ class ResConv1dBR(nn.Module):
         self.net2 = Conv1dBR(int(in_channels * res_expansion), in_channels , bias=bias, activation=None)
     def forward(self, x):
         return self.act(self.net2(self.net1(x)) + x)
-
-
 class LocalExtraction(nn.Module):
-    def __init__(self, in_channels, out_channels, blocks=1, res_expansion=1,bias=True,activation='relu'):
+    def __init__(self, in_channels, out_channels, blocks=2, k =20, res_expansion=1,bias=True,activation='relu'):
         super(LocalExtraction, self).__init__()
         """
         input: [b,g,k,d]: output:[b,d,g]
         """
-        in_channels = 2*in_channels
+        self.in_channels, self.k = in_channels, k
         self.transfer = Conv1dBR(in_channels, out_channels, bias=bias, activation=activation)
         
         operation = []
         for _ in range(blocks):
             operation.append(
-                ResConv1dBR(out_channels, res_expansion=res_expansion,bias=bias,activation=activation))
+                ResConv1dBR(out_channels, res_expansion=res_expansion, bias=bias,activation=activation))
         self.operation = nn.Sequential(*operation) # TODO : 循环写成包便于调用
 
     def forward(self, x):
-        b, n, s, d = x.size()  # torch.Size([32, 512, 32, 6])
-        x = x.permute(0, 1, 3, 2).contiguous().view(-1, d, s)
-        # x = x.reshape(-1, d, s)
+        # x [B, npoint, nsample, D]->[B, D, nsample]
+        x = x.permute(0, 1, 3, 2).contiguous().view(-1, self.in_channels, self.k) # [B*npoint, D, nsample]
         x = self.transfer(x)
-        batch_size, _, _ = x.size()
-        x = self.operation(x)  # [b, d, k]
-        x = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
-        x = x.reshape(b, n, -1).permute(0, 2, 1)
+        x = self.operation(x)  # [B, D, nsample]
         return x
 
-
 class GlobalExtraction(nn.Module):
-    def __init__(self, channels, blocks=1, groups=1, res_expansion=1, bias=True, activation='relu'):
+    def __init__(self, in_channels, out_channels, blocks=2, res_expansion=1, bias=True, activation='relu'):
         """
         input[b,d,g]; output[b,d,g]
-        :param channels:
-        :param blocks:
         """
         super(GlobalExtraction, self).__init__()
+        self.transfer = Conv1dBR(in_channels, out_channels, bias=bias, activation=activation)
+
         operation = []
         for _ in range(blocks):
             operation.append(
-                ResConv1dBR(channels, groups=groups, res_expansion=res_expansion, bias=bias, activation=activation)
+                ResConv1dBR(out_channels, res_expansion=res_expansion, bias=bias, activation=activation)
             )
         self.operation = nn.Sequential(*operation)
 
     def forward(self, x):  # [b, d, g]
-        return self.operation(x)
+        return self.operation(self.transfer(x))
+
 class SGPool(nn.Module):
     def __init__(self, npoint, radius, k, in_channels, bias=True, activation='leakyrelu'):
         super(SGPool, self).__init__()
         self.npoint, self.radius, self.k, self.in_channels= npoint, radius, k, in_channels
-        self.conv = Conv1dBR(in_channels, in_channels, bias, activation)
+        # self.conv = Conv1dBR(in_channels, in_channels, bias, activation)
+        self.resconv = LocalExtraction(in_channels, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
 
     def forward(self, xyz, features):
         sub_xyz, neighbor_features, _ = \
             sample_and_group(self.npoint, self.radius, self.k, xyz, features) # [B, npoint, nsample, D]
-        # b, n, s, d = neighbor_features.shape
-        
-        neighbor_features = neighbor_features\
-            .permute(0, 1, 3, 2).contiguous().view(-1, self.in_channels, self.k)
-        neighbor_features = self.conv(neighbor_features) # [B*npoint, D, nsample]
-
-        # TODO : res_convbr
+        neighbor_features = self.resconv(neighbor_features) # [B*npoint, D, nsample]
         neighbor_features = neighbor_features\
             .view(-1, self.npoint, self.in_channels, self.k).permute(0, 2, 1, 3).contiguous()
 
@@ -314,22 +299,12 @@ class LPFA(nn.Module):
 class CIC(nn.Module):
     def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='leakyrelu'):
         super(CIC, self).__init__()
-        self.npoint = npoint
-
-        self.in_channels = in_channels
+        self.in_channels,self.npoint,self.k = in_channels,npoint,k
         self.output_channels = output_channels
-        # self.bottleneck_ratio = bottleneck_ratio
-        # self.radius = radius
-        # self.k = k
-        
         planes = in_channels // bottleneck_ratio
-
         self.SGPool = SGPool(npoint, radius, k, in_channels, bias=False, activation=activation)
-        self.conv1 = Conv1dBR(in_channels, planes, bias=False, activation=activation)
-        # self.conv1 = nn.Sequential(
-        #     nn.Conv1d(in_channels, planes, kernel_size=1, bias=False),
-        #     nn.BatchNorm1d(planes),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True))
+        self.conv1 = GlobalExtraction(in_channels, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
+
         self.lpfa = LPFA(planes, planes, k, mlp_num=mlp_num, initial=False)
 
         self.conv2 = Conv1dBR(planes, output_channels, bias=False, activation=None)

@@ -116,7 +116,7 @@ class ScanObjectNN(Dataset):
     def check_ln_scanobjectnn(self, DATA_DIR):
         if not os.path.exists(DATA_DIR):
             os.makedirs(DATA_DIR)
-        dataset_dir = '/media/data/h5_files'
+        dataset_dir = '/home/chengle/worksapce/data/h5_files'
         if not os.path.exists(os.path.join(DATA_DIR, 'h5_files')):
             os.system('ln -s ' + dataset_dir + ' ' + DATA_DIR)
             

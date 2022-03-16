@@ -1,3 +1,6 @@
+"""
+resconv3.16
+"""
 import os
 import torch
 import torch.nn as nn
@@ -13,6 +16,17 @@ def knn(x, k):
 def square_distance(src, dst):
     """
     Calculate Euclid distance between each two points.
+
+    src^T * dst = xn * xm + yn * ym + zn * zm;
+    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
+    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
+    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
+         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
     """
     B, N, _ = src.shape
     _, M, _ = dst.shape
@@ -22,7 +36,6 @@ def square_distance(src, dst):
     return dist
 def index_points(points, idx):
     """
-
     Input:
         points: input points data, [B, N, C]
         idx: sample index data, [B, S]
@@ -38,30 +51,7 @@ def index_points(points, idx):
     batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
     new_points = points[batch_indices, idx, :]
     return new_points
-
 def farthest_point_sample(xyz, npoint):
-    """
-    Input:
-        xyz: pointcloud data, [B, N, 3]
-        npoint: number of samples
-    Return:
-        centroids: sampled pointcloud index, [B, npoint]
-    """
-    device = xyz.device
-    B, N, C = xyz.shape
-    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
-    distance = torch.ones(B, N).to(device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device) * 0
-    batch_indices = torch.arange(B, dtype=torch.long).to(device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.max(distance, -1)[1]
-    return centroids
-def farthest_point_sample1(xyz, npoint):
     """
     Input:
         xyz: pointcloud data, [B, N, 3]
@@ -82,7 +72,6 @@ def farthest_point_sample1(xyz, npoint):
         distance = torch.min(distance, dist)
         farthest = torch.max(distance, -1)[1]
     return centroids    
-
 def query_ball_point(radius, nsample, xyz, new_xyz):
     """
     Input:
@@ -104,7 +93,7 @@ def query_ball_point(radius, nsample, xyz, new_xyz):
     mask = group_idx == N
     group_idx[mask] = group_first[mask]
     return group_idx
-def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
+def sample_and_group(npoint, radius, nsample, xyz, points, knn=True):
     """
     Input:
         npoint:
@@ -114,34 +103,136 @@ def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
         points: input points data, [B, N, D]
     Return:
         new_xyz: sampled points position data, [B, npoint, nsample, 3]
-        new_points: sampled points data, [B, npoint, nsample, 3+D]
+        new_points: sampled points data, [B, npoint, nsample, D]
     """
     new_xyz = index_points(xyz, farthest_point_sample(xyz, npoint))
-    # if knn:
-    #     dists = square_distance(new_xyz, xyz)  # B x npoint x N
-    #     idx = dists.argsort()[:, :, :nsample]  # B x npoint x K
-    # else:
-    idx = query_ball_point(radius, nsample, xyz, new_xyz)
-    new_points = index_points(points, idx)
-    if returnfps:
-        return new_xyz, new_points, idx
+    if knn:
+        dists = square_distance(new_xyz, xyz)  # B x npoint x N
+        groupe_idx = dists.argsort()[:, :, :nsample]  # B x npoint x K
     else:
-        return new_xyz, new_points
+        groupe_idx = query_ball_point(radius, nsample, xyz, new_xyz)
+    new_grouped_points = index_points(points, groupe_idx) # [B, npoint, nsample, D]
+    return new_xyz, new_grouped_points, groupe_idx
+def get_act(activation):
+    if activation.lower() == 'gelu':
+        return nn.GELU()
+    elif activation.lower() == 'rrelu':
+        return nn.RReLU(inplace=True)
+    elif activation.lower() == 'selu':
+        return nn.SELU(inplace=True)
+    elif activation.lower() == 'silu':
+        return nn.SiLU(inplace=True)
+    elif activation.lower() == 'hardswish':
+        return nn.Hardswish(inplace=True)
+    elif activation.lower() == 'leakyrelu':
+        return nn.LeakyReLU(negative_slope=0.1, inplace=True)
+    else:
+        return nn.ReLU(inplace=True)
+class Conv1dBR(nn.Module):
+    def __init__(self, in_channels, out_channels, bias=True, activation='leakyrelu'):
+        super(Conv1dBR, self).__init__()
+        if activation is not None:
+            self.act = get_act(activation)
+            self.layers = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias),
+                nn.BatchNorm1d(out_channels),
+                self.act)
+        else:
+            self.layers = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias),
+                nn.BatchNorm1d(out_channels))
+
+    def forward(self, x):
+        return self.layers(x)
+class LinearBR(nn.Module):
+    def __init__(self, in_channels, out_channels, bias=True, activation='leakyrelu', Dropout=True):
+        super(Conv1dBR, self).__init__()
+        self.in_channels = in_channels
+        self.act = get_act(activation)
+        if Dropout:
+            self.layers = nn.Sequential(
+            nn.Linear(in_channels, out_channels, bias=bias),
+            nn.BatchNorm1d(out_channels),
+            self.act, 
+            nn.Dropout(0.5))
+        else:
+            self.layers = nn.Sequential(
+                nn.Linear(in_channels, out_channels, bias=bias),
+                nn.BatchNorm1d(out_channels),
+                self.act
+            )
+    def forward(self, x):
+        if x.shape[-2] == self.in_channels:
+            for i, layer in enumerate(self.layers): 
+                x = layer(x.permute(0, 2, 1)).permute(0, 2, 1) if i == 0 else layer(x)
+        else:
+            self.layers(x)
+        return x       
+class ResConv1dBR(nn.Module):
+    def __init__(self, in_channels, res_expansion=1.0, bias=False, activation='relu'):
+        super(ResConv1dBR, self).__init__()
+        self.act = get_act(activation)
+        self.net1 = Conv1dBR(in_channels, int(in_channels * res_expansion), bias=bias, activation=activation)
+        self.net2 = Conv1dBR(int(in_channels * res_expansion), in_channels , bias=bias, activation=None)
+    def forward(self, x):
+        return self.act(self.net2(self.net1(x)) + x)
+class LocalExtraction(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=2, k =20, res_expansion=1,bias=True,activation='relu'):
+        super(LocalExtraction, self).__init__()
+        """
+        input: [b,g,k,d]: output:[b,d,g]
+        """
+        self.in_channels, self.k = in_channels, k
+        self.transfer = Conv1dBR(in_channels, out_channels, bias=bias, activation=activation)
+        
+        operation = []
+        for _ in range(blocks):
+            operation.append(
+                ResConv1dBR(out_channels, res_expansion=res_expansion, bias=bias,activation=activation))
+        self.operation = nn.Sequential(*operation) # TODO : 循环写成包便于调用
+
+    def forward(self, x):
+        # x [B, npoint, nsample, D]->[B, D, nsample]
+        x = x.permute(0, 1, 3, 2).contiguous().view(-1, self.in_channels, self.k) # [B*npoint, D, nsample]
+        x = self.transfer(x)
+        x = self.operation(x)  # [B, D, nsample]
+        return x
+
+class GlobalExtraction(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=2, res_expansion=1, bias=True, activation='relu'):
+        """
+        input[b,d,g]; output[b,d,g]
+        """
+        super(GlobalExtraction, self).__init__()
+        self.transfer = Conv1dBR(in_channels, out_channels, bias=bias, activation=activation)
+
+        operation = []
+        for _ in range(blocks):
+            operation.append(
+                ResConv1dBR(out_channels, res_expansion=res_expansion, bias=bias, activation=activation)
+            )
+        self.operation = nn.Sequential(*operation)
+
+    def forward(self, x):  # [b, d, g]
+        return self.operation(self.transfer(x))
 
 class SGPool(nn.Module):
-    def __init__(self, npoint, radius, k):
+    def __init__(self, npoint, radius, k, in_channels, bias=True, activation='leakyrelu'):
         super(SGPool, self).__init__()
-        self.npoint, self.radius, self.k = npoint, radius, k
+        self.npoint, self.radius, self.k, self.in_channels= npoint, radius, k, in_channels
+        # self.conv = Conv1dBR(in_channels, in_channels, bias, activation)
+        self.resconv = LocalExtraction(in_channels, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
 
     def forward(self, xyz, features):
-        sub_xyz, neighborhood_features = sample_and_group(self.npoint, self.radius, self.k, xyz, features)
+        sub_xyz, neighbor_features, _ = \
+            sample_and_group(self.npoint, self.radius, self.k, xyz, features) # [B, npoint, nsample, D]
+        neighbor_features = self.resconv(neighbor_features) # [B*npoint, D, nsample]
+        neighbor_features = neighbor_features\
+            .view(-1, self.npoint, self.in_channels, self.k).permute(0, 2, 1, 3).contiguous()
 
-        neighborhood_features = neighborhood_features.permute(0, 3, 1, 2).contiguous()
-        sub_features = F.max_pool2d(
-            neighborhood_features, kernel_size=[1, neighborhood_features.shape[3]]
-        )  # bs, c, n, 1
+        sub_features = F.max_pool2d(neighbor_features, kernel_size=[1, self.k])  # bs, c, n, 1
         sub_features = torch.squeeze(sub_features, -1)  # bs, c, n
-        return sub_xyz, sub_features
+        return sub_xyz.transpose(1, 2), sub_features
 
 class LPFA(nn.Module):
     def __init__(self, in_channel, out_channel, k, mlp_num=2, initial=False):
@@ -206,44 +297,27 @@ class LPFA(nn.Module):
         return feature #bs, c, n, k
 
 class CIC(nn.Module):
-    def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2):
+    def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='leakyrelu'):
         super(CIC, self).__init__()
-        self.npoint = npoint
-
-        self.in_channels = in_channels
+        self.in_channels,self.npoint,self.k = in_channels,npoint,k
         self.output_channels = output_channels
-        self.bottleneck_ratio = bottleneck_ratio
-        self.radius = radius
-        self.k = k
-        
         planes = in_channels // bottleneck_ratio
+        self.SGPool = SGPool(npoint, radius, k, in_channels, bias=False, activation=activation)
+        self.conv1 = GlobalExtraction(in_channels, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
 
-        self.maxpool = SGPool(npoint, radius, k)
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(in_channels, planes, kernel_size=1, bias=False),
-            nn.BatchNorm1d(planes),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True))
         self.lpfa = LPFA(planes, planes, k, mlp_num=mlp_num, initial=False)
 
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(planes, output_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(output_channels))
+        self.conv2 = Conv1dBR(planes, output_channels, bias=False, activation=None)
 
         if in_channels != output_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels,
-                          output_channels,
-                          kernel_size=1,
-                          bias=False),
-                nn.BatchNorm1d(output_channels))
-        self.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            self.shortcut = Conv1dBR(in_channels, output_channels, bias=False, activation=None)
+        self.relu = get_act(activation)
         
 
     def forward(self, xyz, x):
         # max pool
         if xyz.size(-1) != self.npoint:#(b,d,n)
-            xyz, x = self.maxpool(xyz.transpose(1, 2).contiguous(), x.transpose(1, 2).contiguous())# bs, d, n
-            xyz = xyz.transpose(1, 2) # bs, 3, n
+            xyz, x = self.SGPool(xyz.transpose(1, 2).contiguous(), x.transpose(1, 2).contiguous())# bs, d, n
         shortcut = x
         x = self.conv1(x)  # bs, d', n
 
@@ -259,7 +333,7 @@ class CIC(nn.Module):
         return xyz, x
 
 class Module(nn.Module):
-    def __init__(self, cfg, num_classes=40, k=20):
+    def __init__(self, cfg=None, num_classes=40, k=20):
         super(Module, self).__init__()
         self.input_embedding = Input_embedding(in_channel=3, out_channel=64, k=k, mlp_num=1)
         # self.lpfa = LPFA(9, additional_channel, k=k, mlp_num=1, initial=True)
@@ -358,7 +432,7 @@ class Input_embedding(nn.Module):
         return x
 
 if __name__ == '__main__':
-    data = torch.rand(16, 3, 1024)
+    data = torch.rand(16, 1024, 3)
     print("===> testing pointMLP ...")
     model = Module().cuda()
     out = model(data.cuda())
