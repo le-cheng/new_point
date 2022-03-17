@@ -4,8 +4,8 @@ import importlib
 import os
 import sys
 import time
-import numpy as np
 
+import numpy as np
 import torch
 from tensorboardX import SummaryWriter
 from torch.optim.lr_scheduler import CosineAnnealingLR
