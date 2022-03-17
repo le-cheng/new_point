@@ -313,17 +313,20 @@ class LPFA(nn.Module):
                                  nn.BatchNorm2d(out_channel),
                                  nn.LeakyReLU(0.2)))
             in_channel = out_channel
-        self.mlp = nn.Sequential(*self.mlp)        
+        self.mlp = nn.Sequential(*self.mlp)     
+
+        self.affine_alpha = nn.Parameter(torch.ones([1,1,1,in_channel]))
+        self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1,in_channel]))   
 
     def forward(self, x, xyz, idx=None): # x [b, d, n] xyz [b,3,n]
         x = self.group_feature(x, xyz, idx)
         x = self.mlp(x) # TODO :local
 
         # if self.initial:
-        #     x = x.max(dim=-1, keepdim=False)[0]
+        x = x.max(dim=-1, keepdim=False)[0]
         # else:
         # TODO : 测试最大池化
-        x = x.mean(dim=-1, keepdim=False)
+        # x = x.mean(dim=-1, keepdim=False)
         return x
 
     def group_feature(self, x, xyz, idx):
@@ -344,12 +347,20 @@ class LPFA(nn.Module):
         point_feature = torch.cat((points, point_feature, point_feature - points),
                                 dim=3).permute(0, 3, 1, 2).contiguous()
 
+
         x = x.transpose(2, 1).contiguous() # bs, n, d
         feature = x.view(batch_size * num_points, -1)[idx, :]
         feature = feature.view(batch_size, num_points, self.k, num_dims)  #bs, n, k, d
         x = x.view(batch_size, num_points, 1, num_dims)
         # edge_feature = feature - x
 
+        # ----------------------------------------------------------------
+        std = torch.std((feature-x).reshape(batch_size,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
+        # print(std.shape)
+        # print(std)
+        grouped_points = (feature-x)/(std + 1e-5)
+        grouped_points = self.affine_alpha*grouped_points + self.affine_beta
+        # os._exit(0)
         feature = torch.cat((x-feature, feature), dim=-1).permute(0, 3, 1, 2).contiguous()
         # TODO :边信息和节点信息是否需要归一化
         # TODO :是否需要带上point_feature
