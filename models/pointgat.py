@@ -105,14 +105,16 @@ def sample_and_group(npoint, radius, nsample, xyz, points, knn=True):
         new_xyz: sampled points position data, [B, npoint, nsample, 3]
         new_points: sampled points data, [B, npoint, nsample, D]
     """
-    new_xyz = index_points(xyz, farthest_point_sample(xyz, npoint))
+    fps_idx=farthest_point_sample(xyz, npoint)
+    new_xyz = index_points(xyz, fps_idx)
+    new_points = index_points(points, fps_idx)
     if knn:
         dists = square_distance(new_xyz, xyz)  # B x npoint x N
         groupe_idx = dists.argsort()[:, :, :nsample]  # B x npoint x K
     else:
         groupe_idx = query_ball_point(radius, nsample, xyz, new_xyz)
     new_grouped_points = index_points(points, groupe_idx) # [B, npoint, nsample, D]
-    return new_xyz, new_grouped_points, groupe_idx
+    return new_xyz, new_grouped_points, new_points
 def get_act(activation):
     if activation.lower() == 'gelu':
         return nn.GELU()
@@ -193,7 +195,7 @@ class LocalExtraction(nn.Module):
 
     def forward(self, x):
         # x [B, npoint, nsample, D]->[B, D, nsample]
-        x = x.permute(0, 1, 3, 2).contiguous().view(-1, self.in_channels, self.k) # [B*npoint, D, nsample]
+        x = x.view(-1, self.in_channels, self.k) # [B*npoint, D, nsample]
         x = self.transfer(x)
         x = self.operation(x)  # [B, D, nsample]
         return x
@@ -221,12 +223,20 @@ class SGPool(nn.Module):
         super(SGPool, self).__init__()
         self.npoint, self.radius, self.k, self.in_channels= npoint, radius, k, in_channels
         # self.conv = Conv1dBR(in_channels, in_channels, bias, activation)
-        self.resconv = LocalExtraction(in_channels, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
-
+        self.resconv = LocalExtraction(in_channels*2, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
+        self.neighbor_normal = neighbor_normal(in_channels, 32, npoint ,k)
     def forward(self, xyz, features):
-        sub_xyz, neighbor_features, _ = \
+        sub_xyz, neighbor_features, new_points = \
             sample_and_group(self.npoint, self.radius, self.k, xyz, features) # [B, npoint, nsample, D]
-        neighbor_features = self.resconv(neighbor_features) # [B*npoint, D, nsample]
+        # print(neighbor_features.shape)
+        # print(new_points.shape)
+        # 
+        grouped_points,points = self.neighbor_normal(neighbor_features, new_points)
+        # os._exit(0)
+        feature = torch.cat((grouped_points, points), dim=-1).permute(0, 1, 3, 2).contiguous()
+
+
+        neighbor_features = self.resconv(feature) # [B*npoint, D, nsample]
         neighbor_features = neighbor_features\
             .view(-1, self.npoint, self.in_channels, self.k).permute(0, 2, 1, 3).contiguous()
 
@@ -234,89 +244,28 @@ class SGPool(nn.Module):
         sub_features = torch.squeeze(sub_features, -1)  # bs, c, n
         return sub_xyz.transpose(1, 2), sub_features
 
-class LPFA1(nn.Module):
-    def __init__(self, in_channel, out_channel, k, mlp_num=2, initial=False):
-        super(LPFA, self).__init__()
-        self.k = k
-        self.device = torch.device('cuda')
-        self.initial = initial
-
-        if not initial:
-            self.xyz2feature = nn.Sequential(
-                        nn.Conv2d(9, in_channel, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(in_channel))
-
-        self.mlp = []
-        for _ in range(mlp_num):
-            self.mlp.append(nn.Sequential(nn.Conv2d(in_channel, out_channel, 1, bias=False),
-                                 nn.BatchNorm2d(out_channel),
-                                 nn.LeakyReLU(0.2)))
-            in_channel = out_channel
-        self.mlp = nn.Sequential(*self.mlp)        
-
-    def forward(self, x, xyz, idx=None):
-        x = self.group_feature(x, xyz, idx)
-        x = self.mlp(x) # TODO :local
-
-        if self.initial:
-            x = x.max(dim=-1, keepdim=False)[0]
-        else:
-            x = x.mean(dim=-1, keepdim=False)
-        return x
-
-    def group_feature(self, x, xyz, idx):
-        batch_size, num_dims, num_points = x.size()
-
-        if idx is None:
-            idx = knn(xyz, k=self.k)[:,:,:self.k]  # (batch_size, num_points, k)
-
-        idx_base = torch.arange(0, batch_size, device=self.device).view(-1, 1, 1) * num_points
-        idx = idx + idx_base
-        idx = idx.view(-1)
-
-        xyz = xyz.transpose(2, 1).contiguous() # bs, n, 3
-        point_feature = xyz.view(batch_size * num_points, -1)[idx, :]
-        point_feature = point_feature.view(batch_size, num_points, self.k, -1)  # bs, n, k, 3
-        points = xyz.view(batch_size, num_points, 1, 3).expand(-1, -1, self.k, -1)  # bs, n, k, 3
-
-        point_feature = torch.cat((points, point_feature, point_feature - points),
-                                dim=3).permute(0, 3, 1, 2).contiguous()
-
-        if self.initial:
-            return point_feature
-
-        x = x.transpose(2, 1).contiguous() # bs, n, c
-        feature = x.view(batch_size * num_points, -1)[idx, :]
-        feature = feature.view(batch_size, num_points, self.k, num_dims)  #bs, n, k, c
-        x = x.view(batch_size, num_points, 1, num_dims)
-        feature = feature - x
-
-        feature = feature.permute(0, 3, 1, 2).contiguous()
-        point_feature = self.xyz2feature(point_feature)  #bs, c, n, k
-        feature = F.leaky_relu(feature + point_feature, 0.2)
-        return feature #bs, c, n, k
 class LPFA(nn.Module):
-    def __init__(self, in_channel, out_channel, k, mlp_num=2):
+    def __init__(self, in_channels, out_channel,npoint, k, mlp_num=2):
         super(LPFA, self).__init__()
         self.k = k
         self.device = torch.device('cuda')
-
-        
         self.xyz2feature = nn.Sequential(
-                    nn.Conv2d(9, in_channel, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(in_channel))
+                    nn.Conv2d(9, in_channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(in_channels))
 
-        in_channel = in_channel *2
+        in_channels = in_channels *2
         self.mlp = []
         for _ in range(mlp_num):
-            self.mlp.append(nn.Sequential(nn.Conv2d(in_channel, out_channel, 1, bias=False),
+            self.mlp.append(nn.Sequential(nn.Conv2d(in_channels, out_channel, 1, bias=False),
                                  nn.BatchNorm2d(out_channel),
                                  nn.LeakyReLU(0.2)))
-            in_channel = out_channel
+            in_channels = out_channel
         self.mlp = nn.Sequential(*self.mlp)     
 
-        self.affine_alpha = nn.Parameter(torch.ones([1,1,1,in_channel]))
-        self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1,in_channel]))   
+        self.neighbor_normal = neighbor_normal(in_channels, 32, npoint ,k)
+
+        # self.affine_alpha = nn.Parameter(torch.ones([1,1,1,in_channel]))
+        # self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1,in_channel]))   
 
     def forward(self, x, xyz, idx=None): # x [b, d, n] xyz [b,3,n]
         x = self.group_feature(x, xyz, idx)
@@ -339,29 +288,32 @@ class LPFA(nn.Module):
         idx = idx + idx_base
         idx = idx.view(-1)
 
-        xyz = xyz.transpose(2, 1).contiguous() # bs, n, 3
-        point_feature = xyz.view(batch_size * num_points, -1)[idx, :]
-        point_feature = point_feature.view(batch_size, num_points, self.k, -1)  # bs, n, k, 3
-        points = xyz.view(batch_size, num_points, 1, 3).expand(-1, -1, self.k, -1)  # bs, n, k, 3
+        # xyz = xyz.transpose(2, 1).contiguous() # bs, n, 3
+        # point_feature = xyz.view(batch_size * num_points, -1)[idx, :]
+        # point_feature = point_feature.view(batch_size, num_points, self.k, -1)  # bs, n, k, 3
+        # points = xyz.view(batch_size, num_points, 1, 3).expand(-1, -1, self.k, -1)  # bs, n, k, 3
 
-        point_feature = torch.cat((points, point_feature, point_feature - points),
-                                dim=3).permute(0, 3, 1, 2).contiguous()
+        # point_feature = torch.cat((points, point_feature, point_feature - points),
+        #                         dim=3).permute(0, 3, 1, 2).contiguous()
 
 
         x = x.transpose(2, 1).contiguous() # bs, n, d
         feature = x.view(batch_size * num_points, -1)[idx, :]
         feature = feature.view(batch_size, num_points, self.k, num_dims)  #bs, n, k, d
-        x = x.view(batch_size, num_points, 1, num_dims)
-        # edge_feature = feature - x
+        
+        grouped_points,points = self.neighbor_normal(feature, x)
+        
+        # x = x.view(batch_size, num_points, 1, num_dims)
+        # # edge_feature = feature - x
 
-        # ----------------------------------------------------------------
-        std = torch.std((feature-x).reshape(batch_size,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
-        # print(std.shape)
-        # print(std)
-        grouped_points = (feature-x)/(std + 1e-5)
-        grouped_points = self.affine_alpha*grouped_points + self.affine_beta
+        # # ----------------------------------------------------------------
+        # std = torch.std((feature-x).reshape(batch_size,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
+        # # print(std.shape)
+        # # print(std)
+        # grouped_points = (feature-x)/(std + 1e-5)
+        # grouped_points = self.affine_alpha*grouped_points + self.affine_beta
         # os._exit(0)
-        feature = torch.cat((x-feature, feature), dim=-1).permute(0, 3, 1, 2).contiguous()
+        feature = torch.cat((grouped_points, points), dim=-1).permute(0, 3, 1, 2).contiguous()
         # TODO :边信息和节点信息是否需要归一化
         # TODO :是否需要带上point_feature
         #point_feature = torch.cat((feature - x, feature, point_feature), dim=-1)
@@ -371,16 +323,16 @@ class LPFA(nn.Module):
 
         # feature = F.leaky_relu(edge_feature + point_feature, 0.2)
         return feature #bs, c, n, k
-class CIC(nn.Module):
+class BackboneFeature(nn.Module):
     def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='leakyrelu'):
-        super(CIC, self).__init__()
+        super(BackboneFeature, self).__init__()
         self.in_channels,self.npoint,self.k = in_channels,npoint,k
         self.output_channels = output_channels
         planes = in_channels // bottleneck_ratio
         self.SGPool = SGPool(npoint, radius, k, in_channels, bias=False, activation=activation)
         self.conv1 = GlobalExtraction(in_channels, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
 
-        self.lpfa = LPFA(planes, planes, k, mlp_num=mlp_num)
+        self.lpfa = LPFA(planes, planes, npoint=npoint, k=k, mlp_num=mlp_num)
 
         self.conv2 = Conv1dBR(planes, output_channels, bias=False, activation=None)
 
@@ -411,68 +363,106 @@ class CIC(nn.Module):
 class Module(nn.Module):
     def __init__(self, cfg=None, num_classes=40, k=20):
         super(Module, self).__init__()
-        self.input_embedding = Input_embedding(in_channels=3, out_channels=64, k=k, mlp_num=1)
+        self.input_embedding = Input_embedding(in_channels=3, out_channels=64, batch_size=cfg.batch_size,npoint=1024, k=k, mlp_num=1)
         # self.lpfa = LPFA(9, additional_channel, k=k, mlp_num=1, initial=True)
         # encoder
-        self.cic11 = CIC(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=64, bottleneck_ratio=2, mlp_num=1)
-        self.cic12 = CIC(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=64, bottleneck_ratio=4, mlp_num=1)
+        self.cic11 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=128, bottleneck_ratio=2, mlp_num=1)
+        # self.cic12 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=64, bottleneck_ratio=4, mlp_num=1)
         
-        self.cic21 = CIC(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=128, bottleneck_ratio=2, mlp_num=1)
-        self.cic22 = CIC(npoint=1024, radius=0.1, k=k, in_channels=128, output_channels=128, bottleneck_ratio=4, mlp_num=1)
+        self.cic21 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=128, output_channels=256, bottleneck_ratio=2, mlp_num=1)
+        # self.cic22 = BackboneFeature(npoint=1024, radius=0.1, k=k, in_channels=128, output_channels=128, bottleneck_ratio=4, mlp_num=1)
 
-        self.cic31 = CIC(npoint=256, radius=0.1, k=k, in_channels=128, output_channels=256, bottleneck_ratio=2, mlp_num=1)
-        self.cic32 = CIC(npoint=256, radius=0.2, k=k, in_channels=256, output_channels=256, bottleneck_ratio=4, mlp_num=1)
+        self.cic31 = BackboneFeature(npoint=256, radius=0.1, k=k, in_channels=256, output_channels=256, bottleneck_ratio=2, mlp_num=1)
+        # self.cic32 = BackboneFeature(npoint=256, radius=0.2, k=k, in_channels=256, output_channels=256, bottleneck_ratio=4, mlp_num=1)
 
-        self.cic41 = CIC(npoint=64, radius=0.2, k=k, in_channels=256, output_channels=512, bottleneck_ratio=2, mlp_num=1)
-        self.cic42 = CIC(npoint=64, radius=0.4, k=k, in_channels=512, output_channels=512, bottleneck_ratio=4, mlp_num=1)
+        self.cic41 = BackboneFeature(npoint=256, radius=0.2, k=k, in_channels=256, output_channels=512, bottleneck_ratio=2, mlp_num=1)
+        # self.cic42 = BackboneFeature(npoint=64, radius=0.4, k=k, in_channels=512, output_channels=512, bottleneck_ratio=4, mlp_num=1)
 
         
-        self.conv0 = nn.Sequential(
-            nn.Conv1d(512, 1024, kernel_size=1, bias=False),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(inplace=True))
+        # self.conv0 = nn.Sequential(
+        #     nn.Conv1d(512, 1024, kernel_size=1, bias=False),
+        #     nn.BatchNorm1d(1024),
+        #     nn.ReLU(inplace=True))
         self.classification = nn.Sequential(
-            nn.Linear(1024 * 2, 512, bias=False),
-            nn.BatchNorm1d(512),
+            nn.Linear(512*2, 256, bias=False),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True), # inplace = True,会改变输入数据的值,节省反复申请与释放内存的空间与时间,只是将原来的地址传递,效率更好
             nn.Dropout(p=0.5),
-            nn.Linear(512, num_classes)
+            nn.Linear(256, num_classes)
             )
-        self.conv1 = nn.Linear(1024 * 2, 512, bias=False)
-        self.conv2 = nn.Linear(512, num_classes)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.dp1 = nn.Dropout(p=0.5)
+        # self.conv1 = nn.Linear(1024 * 2, 512, bias=False)
+        # self.conv2 = nn.Linear(512, num_classes)
+        # self.bn1 = nn.BatchNorm1d(512)
+        # self.dp1 = nn.Dropout(p=0.5)
 
     def forward(self, xyz):
+        # print(xyz.shape)
         xyz = xyz.permute(0,2,1).contiguous()
         points = self.input_embedding(xyz)
 
         l1_xyz, l1_points = self.cic11(xyz, points)
-        l1_xyz, l1_points = self.cic12(l1_xyz, l1_points)
+        # l1_xyz, l1_points = self.cic12(l1_xyz, l1_points)
 
         l2_xyz, l2_points = self.cic21(l1_xyz, l1_points)
-        l2_xyz, l2_points = self.cic22(l2_xyz, l2_points)
+        # l2_xyz, l2_points = self.cic22(l2_xyz, l2_points)
 
         l3_xyz, l3_points = self.cic31(l2_xyz, l2_points)
-        l3_xyz, l3_points = self.cic32(l3_xyz, l3_points)
+        # l3_xyz, l3_points = self.cic32(l3_xyz, l3_points)
  
         l4_xyz, l4_points = self.cic41(l3_xyz, l3_points)
-        l4_xyz, l4_points = self.cic42(l4_xyz, l4_points)
+        # l4_xyz, l4_points = self.cic42(l4_xyz, l4_points)
 
-        x = self.conv0(l4_points)
-        x_max = F.adaptive_max_pool1d(x, 1)
-        x_avg = F.adaptive_avg_pool1d(x, 1)
+        # x = self.conv0(l4_points)
+        x_max = F.adaptive_max_pool1d(l4_points, 1)
+        x_avg = F.adaptive_avg_pool1d(l4_points, 1)
         
         x = torch.cat((x_max, x_avg), dim=1).squeeze(-1)
+        # print(x.shape)
+        # os._exit(0)
         x = self.classification(x)
         return x
 
+class xyz_normal(nn.Module):
+    def __init__(self,b,dim,num):#[b , dim, num]
+        super(xyz_normal, self).__init__()
+        self.b,self.d,self.num=b,dim,num
+        self.ln = nn.LayerNorm(dim*num, elementwise_affine=False)
+        
+    def forward(self, x):#[b , dim, num]
+        x = x - torch.mean(x, dim=-1, keepdim=True)
+        # print(x.shape)
+        # os._exit(0)
+        x = x.view(self.b,-1)
+        x = self.ln(x).view(self.b,self.d,self.num)
+        return x
+
+class neighbor_normal(nn.Module):
+    def __init__(self, in_channels,b, num ,k):#[b , num,dim, k]
+        super(neighbor_normal, self).__init__()
+        self.b,self.num,self.k=b,num,k
+       
+        self.affine_alpha = nn.Parameter(torch.ones([1, 1, 1, in_channels]))
+        self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, in_channels]))
+        
+    def forward(self, grouped_points, points):#[b,num,k,dim]  [b, num, dim]
+        points = points.view(self.b, self.num, 1, -1).expand(-1, -1, self.k, -1)  
+        # print(points.shape)
+        # os._exit(0)
+        res = grouped_points-points
+        std = torch.std(res.reshape(self.b,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
+        grouped_points = res/(std + 1e-5)
+        grouped_points = self.affine_alpha*grouped_points + self.affine_beta
+        return grouped_points,points#[b , num,dim, k]
+
 class Input_embedding(nn.Module):  
-    def __init__(self, in_channels, out_channels, k, mlp_num, bias=False,activation='leakyrelu'):
+    def __init__(self, in_channels, out_channels, batch_size,npoint, k, mlp_num, bias=False,activation='leakyrelu'):
         super(Input_embedding, self).__init__()
         self.k = k
+        self.xyznormal = xyz_normal(batch_size ,in_channels, npoint)
+        self.neighbor_normal = neighbor_normal(in_channels,batch_size, npoint ,k)
+
         self.conv = []
-        in_channels=in_channels*3
+        in_channels=in_channels*2
         for _ in range(mlp_num):
             self.conv.append(Conv1dBR(in_channels, out_channels, bias=bias, activation=activation))
             in_channels = out_channels
@@ -491,14 +481,21 @@ class Input_embedding(nn.Module):
         idx = idx + idx_base
         idx = idx.view(-1)
 
+        xyz = self.xyznormal(xyz)
         xyz = xyz.transpose(2, 1).contiguous() # bs, n, 3
         point_feature = xyz.view(batch_size * num_points, -1)[idx, :]
         point_feature = point_feature.view(batch_size, num_points, self.k, -1)  # bs, n, k, 3
-        points = xyz.view(batch_size, num_points, 1, -1).expand(-1, -1, self.k, -1)  # bs, n, k, 3
+        
+        grouped_points,points = self.neighbor_normal(point_feature, xyz)
 
+        # points = xyz.view(batch_size, num_points, 1, -1).expand(-1, -1, self.k, -1)  # bs, n, k, 3
         point_feature = torch.cat((
-            points, point_feature, points - point_feature # TODO :距离，数据标准化
-            ), dim=3).permute(0, 1, 3, 2).contiguous().view(batch_size* num_points, -1, self.k)
+            points, grouped_points # TODO :距离，数据标准化
+            ), dim=3).permute(0, 1, 3, 2).contiguous().view(batch_size*num_points, -1, self.k)
+
+        # point_feature = torch.cat((
+        #     points, point_feature, points - point_feature # TODO :距离，数据标准化
+        #     ), dim=3).permute(0, 1, 3, 2).contiguous().view(batch_size* num_points, -1, self.k)
         
         # x = self.group_feature(x, xyz, idx)
         x = self.conv(point_feature).view(batch_size, num_points, -1, self.k).permute(0,2,1,3)
@@ -506,8 +503,12 @@ class Input_embedding(nn.Module):
         return x
 
 if __name__ == '__main__':
-    data = torch.rand(16, 1024, 3)
+    import sys
+    sys.path.append("../") 
+    from utils import read_yaml
+    cfg = read_yaml('../configs/config.yaml')
+    data = torch.rand(32, 1024, 3)
     print("===> testing pointMLP ...")
-    model = Module().cuda()
+    model = Module(cfg).cuda()
     out = model(data.cuda())
     print(out.shape)

@@ -1,5 +1,5 @@
 EXP:
-  exp_name: &exp_name scanobjectnn_cls_pointgatv3_resconv
+  exp_name: &exp_name scanobjectnn_cls_pointgatv4_norm
   # exp_name: &exp_name scanobjectnn_cls_pointgatv2_SGPool # 数据+任务+模型
   # exp_name: &exp_name scanobjectnn_cls_dgcnnx2 # 数据+任务+模型
   log_dir: &log_dir logs/
