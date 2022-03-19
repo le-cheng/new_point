@@ -4,6 +4,7 @@ import importlib
 import os
 import sys
 import time
+from tkinter import N
 
 import numpy as np
 import torch
@@ -138,7 +139,7 @@ def main():
     logger.info('Load dataset ---------------')
     TRAIN_DATASET, TEST_DATASET=dataset_get(cfg.data_dir, model_name = cfg.data_name, num_points=cfg.num_point)
     Train_DataLoader = DataLoader(TRAIN_DATASET, num_workers=cfg.workers, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
-    Test_DataLoader = DataLoader(TEST_DATASET, num_workers=cfg.workers, batch_size=cfg.test_batch_size, drop_last=False)
+    Test_DataLoader = DataLoader(TEST_DATASET, num_workers=cfg.workers, batch_size=cfg.test_batch_size, drop_last=True)
     
     
     global_epoch = 0
@@ -154,41 +155,42 @@ def main():
         epoch_t1 = time.time()
         logger.info('Epoch %d (%d/%s):' % (global_epoch + 1, epoch + 1, cfg.epochs))
 
-        train_acc, train_loss = train(model, Train_DataLoader, optimizer, epoch, lossfn)
+        train_acc, train_loss = train(model, Train_DataLoader, optimizer, lossfn)
         logger.info('Train Accuracy: %f , Train Loss: %f'\
              % (train_acc, train_loss))
-        writer.add_scalar('train_Acc', train_acc, epoch)
-        writer.add_scalar('train_Loss', train_loss, epoch)
+        writer.add_scalar('Test/train_Acc', train_acc, epoch)
+        writer.add_scalar('Loss/train_Loss', train_loss, epoch)
         scheduler.step()
 
 
-        test_acc, class_acc = test(model, Test_DataLoader, cfg.num_class)
+        test_acc, class_acc, test_loss= test(model, Test_DataLoader, cfg.num_class, lossfn)
         # print(list(model.state_dict().keys()))
         # raise ValueError
         if (class_acc >= best_class_acc):
             best_class_acc = class_acc
         if (test_acc >= best_test_acc):
             best_test_acc = test_acc
-        logger.info('Test Accuracy: %f, Class Accuracy: %f, Best: [%f]'% (test_acc, class_acc, best_test_acc))
+        logger.info('Test Acc: %f, Class Acc: %f, Loss:%f, Best: [%f]'% (test_acc, class_acc, test_loss,best_test_acc))
         # logger.info('Best Accuracy: [%f], Class Accuracy: [%f]'% (best_test_acc, best_class_acc))   
         if (test_acc >= best_test_acc):
-            if (test_acc >= 0.7):
+            if (test_acc >= 0.8):
                 best_epoch = epoch + 1
                 savepath = root_dir+'/best_model.pth'
                 logger.info('Save model..., Saving at %s'% savepath)
                 state = {
                     'epoch': best_epoch,
-                    'instance_acc': test_acc,
+                    'test_acc': test_acc,
                     'class_acc': class_acc,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
                 torch.save(state, savepath)
 
-        writer.add_scalar('Test_Acc', test_acc, epoch)
-        writer.add_scalar('Best_Acc', best_test_acc, epoch)
-        writer.add_scalar('ClassAcc', class_acc, epoch)
-        writer.add_scalar('Best_ClassAcc', best_class_acc, epoch)
+        writer.add_scalar('Test/Test_Acc', test_acc, epoch)
+        writer.add_scalar('Best/Best_Acc', best_test_acc, epoch)
+        writer.add_scalar('Test/ClassAcc', class_acc, epoch)
+        writer.add_scalar('Best/Best_ClassAcc', best_class_acc, epoch)
+        writer.add_scalar('Loss/test_loss', test_loss, epoch)
 
         global_epoch += 1
         epoch_t2 = time.time()
@@ -201,7 +203,7 @@ def main():
     logger.info('Start Tensorboard with "tensorboard --logdir=runs", view at http://localhost:6006/')
 
 
-def train(model, Train_DataLoader, optimizer, epoch, lossfn):
+def train(model, Train_DataLoader, optimizer, lossfn):
     model.train()
     correct = 0
     epoch_loss = 0 
@@ -209,7 +211,7 @@ def train(model, Train_DataLoader, optimizer, epoch, lossfn):
     Train_DataLoader = tqdm(Train_DataLoader, ncols=100)
 
     for points, label in Train_DataLoader:
-        points, label = points.cuda(non_blocking=True), label.squeeze(-1).cuda(non_blocking=True)
+        points, label = points.cuda(), label.squeeze(-1).cuda()
         pred = model(points)
         loss = lossfn(pred, label.long())
     
@@ -227,22 +229,24 @@ def train(model, Train_DataLoader, optimizer, epoch, lossfn):
     epoch_loss = epoch_loss / len(Train_DataLoader)
     return train_instance_acc, epoch_loss
 
-def test(model, test_loader, num_class=40):
+def test(model, Test_DataLoader, num_class=40, lossfn=N):
     model.eval()# 一定要model.eval()在推理之前调用方法以将 dropout 和批量归一化层设置为评估模式。否则会产生不一致的推理结果。
     class_acc = torch.zeros((num_class,3)).cuda()
-    num_len = len(test_loader.dataset)
+    num_len = len(Test_DataLoader.dataset)
+    correct=0
     with torch.no_grad():
-        correct=0
-        test_loader = tqdm(test_loader, ncols=100)
-        for _, (points, target) in enumerate(test_loader):
-            points, target = points.cuda(), target.squeeze(-1).cuda()
+        Test_DataLoader = tqdm(Test_DataLoader, ncols=100)
+        for points, label in Test_DataLoader:
+            points, label = points.cuda(), label.squeeze(-1).cuda()
             pred = model(points)
+            loss = lossfn(pred, label.long())
             pred = pred.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum()
+            
+            correct += pred.eq(label.view_as(pred)).sum()
 
-            for cat in torch.unique(target):
-                cat_idex = (target==cat)
-                classacc = pred[cat_idex].eq(target[cat_idex].view_as(pred[cat_idex])).sum()
+            for cat in torch.unique(label):
+                cat_idex = (label==cat)
+                classacc = pred[cat_idex].eq(label[cat_idex].view_as(pred[cat_idex])).sum()
                 class_acc[cat,0] += classacc
                 class_acc[cat,1] += cat_idex.sum()
             # correct += pred.eq(target.view_as(pred)).cpu().sum()
@@ -250,7 +254,7 @@ def test(model, test_loader, num_class=40):
         test_instance_acc=correct / num_len
         class_acc[:,2] =  class_acc[:,0] / class_acc[:,1]
         class_acc_t = torch.mean(class_acc[:,2])
-    return test_instance_acc, class_acc_t
+    return test_instance_acc, class_acc_t, loss
 
 
 if __name__ == '__main__':

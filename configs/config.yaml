@@ -1,5 +1,5 @@
 EXP:
-  exp_name: &exp_name scanobjectnn_cls_pointgatv4_norm
+  exp_name: &exp_name scanobjectnn_cls_pointgatv5_imputdown
   # exp_name: &exp_name scanobjectnn_cls_pointgatv2_SGPool # 数据+任务+模型
   # exp_name: &exp_name scanobjectnn_cls_dgcnnx2 # 数据+任务+模型
   log_dir: &log_dir logs/
@@ -11,6 +11,7 @@ DATA:
   num_point: 1024
   batch_size: 32  # batch size for training
   test_batch_size: 32  # batch size for validation during training, memory and speed tradeoff
+  workers: 8  # data loader workers
 
 MODEL:
   num_class: 15 # 15
@@ -21,7 +22,7 @@ TRAIN:
   print_model: False
   learning_rate: 0.1
   epochs: 200
-  workers: 8  # data loader workers
+  
 
 Distributed:
   gpu: 0

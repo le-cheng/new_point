@@ -37,10 +37,10 @@ def square_distance(src, dst):
 def index_points(points, idx):
     """
     Input:
-        points: input points data, [B, N, C]
-        idx: sample index data, [B, S]
+        points: [B, N, Dim]
+        idx:    [B, S]
     Return:
-        new_points:, indexed points data, [B, S, C]
+        new_points:, indexed points data, [B, S, Dim]
     """
     device = points.device
     B = points.shape[0]
@@ -93,7 +93,7 @@ def query_ball_point(radius, nsample, xyz, new_xyz):
     mask = group_idx == N
     group_idx[mask] = group_first[mask]
     return group_idx
-def sample_and_group(npoint, radius, nsample, xyz, points, knn=True):
+def sample_and_group(npoint, radius, k, xyz, points, knn=True):
     """
     Input:
         npoint:
@@ -110,11 +110,18 @@ def sample_and_group(npoint, radius, nsample, xyz, points, knn=True):
     new_points = index_points(points, fps_idx)
     if knn:
         dists = square_distance(new_xyz, xyz)  # B x npoint x N
-        groupe_idx = dists.argsort()[:, :, :nsample]  # B x npoint x K
+        groupe_idx = dists.argsort()[:, :, :k]  # B x npoint x K
     else:
-        groupe_idx = query_ball_point(radius, nsample, xyz, new_xyz)
+        groupe_idx = query_ball_point(radius, k, xyz, new_xyz)
     new_grouped_points = index_points(points, groupe_idx) # [B, npoint, nsample, D]
     return new_xyz, new_grouped_points, new_points
+
+def group_no_sample(points, k, idx=None):
+    if idx is None:
+        idx = knn(points, k=k)[:,:,:k]  # (batch_size, num_points, k)
+    grouped_feature = index_points(points.permute(0,2,1), idx)
+    return grouped_feature, idx
+
 def get_act(activation):
     if activation.lower() == 'gelu':
         return nn.GELU()
@@ -181,12 +188,7 @@ class ResConv1dBR(nn.Module):
 class LocalExtraction(nn.Module):
     def __init__(self, in_channels, out_channels, blocks=2, k =20, res_expansion=1,bias=True,activation='relu'):
         super(LocalExtraction, self).__init__()
-        """
-        input: [b,g,k,d]: output:[b,d,g]
-        """
-        self.in_channels, self.k = in_channels, k
         self.transfer = Conv1dBR(in_channels, out_channels, bias=bias, activation=activation)
-        
         operation = []
         for _ in range(blocks):
             operation.append(
@@ -194,10 +196,14 @@ class LocalExtraction(nn.Module):
         self.operation = nn.Sequential(*operation) # TODO : 循环写成包便于调用
 
     def forward(self, x):
+        b,num,k,dim=x.shape
         # x [B, npoint, nsample, D]->[B, D, nsample]
-        x = x.view(-1, self.in_channels, self.k) # [B*npoint, D, nsample]
-        x = self.transfer(x)
-        x = self.operation(x)  # [B, D, nsample]
+        x = x.view(-1, k, dim).permute(0,2,1) # [B*npoint, D, k]
+        x = self.transfer(x) # TODO : GN
+        x = self.operation(x)  # [B, D, k]
+
+        x = F.adaptive_max_pool1d(x, 1)
+        x = x.view(b, num, -1).permute(0, 2, 1)
         return x
 
 class GlobalExtraction(nn.Module):
@@ -218,32 +224,112 @@ class GlobalExtraction(nn.Module):
     def forward(self, x):  # [b, d, g]
         return self.operation(self.transfer(x))
 
+class xyz_normal(nn.Module):
+    def __init__(self,b,dim,num):#[b , dim, num]
+        super(xyz_normal, self).__init__()
+        self.b,self.d,self.num=b,dim,num
+        self.ln = nn.LayerNorm(dim*num, elementwise_affine=False)
+        
+    def forward(self, x):#[b , dim, num]
+        x = x - torch.mean(x, dim=-1, keepdim=True)
+        x = x.view(self.b,-1)
+        x = self.ln(x).view(self.b,self.d,self.num)
+        return x
+
+class neighbor_normal(nn.Module):
+    def __init__(self, in_channels,out_channels,bias=False):#[b , num,dim, k]
+        super(neighbor_normal, self).__init__()
+        self.conv0 = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias)
+        self.affine_alpha = nn.Parameter(torch.ones([1, 1, 1, out_channels]))
+        self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, out_channels]))
+        
+    def forward(self, grouped_points, points):#[b,num,k,dim]  [b, num, dim]
+        # b, _, num_points = points.shape
+        b, num, k,dim= grouped_points.shape
+        points = points.view(b, num, 1, -1).expand(-1, -1, k, -1)  
+
+        res = grouped_points-points
+        res = self.conv0(res.view(b*num,k,dim).permute(0,2,1)).permute(0,2,1).contiguous().view(b,num,k,-1)
+
+        std = torch.std(res.view(b,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
+        grouped_points = res/(std + 1e-5) # TODO :似乎要好好研究一下 GN
+        grouped_points = self.affine_alpha*grouped_points + self.affine_beta
+        return grouped_points,points#[b , num,k,dim]
+class neighbor_normal1(nn.Module):
+    def __init__(self, in_channels,num ,k):#[b , num,dim, k]
+        super(neighbor_normal1, self).__init__()
+        self.num,self.k=num,k
+
+        # self.conv0 = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias)
+       
+        self.affine_alpha = nn.Parameter(torch.ones([1, 1, 1, in_channels]))
+        self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, in_channels]))
+        
+    def forward(self, grouped_points, points):#[b,num,k,dim]  [b, num, dim]
+        # b, _, num_points = points.shape
+        b, num, k,dim= grouped_points.shape
+        points = points.view(b, self.num, 1, -1).expand(-1, -1, self.k, -1)  
+        # print(points.shape)
+        # os._exit(0)
+        res = grouped_points-points
+
+        # res = self.conv0(res.view(b*num,k,dim).permute(0,2,1)).permute(0,2,1).contiguous().view(b,num,k,-1)
+        std = torch.std(res.view(b,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
+        grouped_points = res/(std + 1e-5) # TODO :似乎要好好研究一下 GN
+        grouped_points = self.affine_alpha*grouped_points + self.affine_beta
+        return grouped_points,points#[b , num,k,dim]
+class Input_embedding(nn.Module):  
+    def __init__(self, in_channels, out_channels,k, mlp_num, bias=False,activation='leakyrelu'):
+        super(Input_embedding, self).__init__()
+        self.k = k
+        out_channels=out_channels//2
+        # self.xyznormal = xyz_normal(batch_size ,in_channels, npoint)# TODO 测试xyznorm
+        self.neighbor_normal = neighbor_normal(in_channels,out_channels,bias=bias)
+
+        self.conv = []
+        
+        for _ in range(mlp_num):
+            self.conv.append(Conv1dBR(in_channels, out_channels, bias=bias, activation=activation))
+            in_channels = out_channels
+        self.conv = nn.Sequential(*self.conv) 
+
+    def forward(self, xyz, idx=None):
+        x = self.conv(xyz) # (b, dim, num)
+        grouped_xyz, idx = group_no_sample(xyz, self.k, idx=idx) # (b, num, k, 3)
+
+        grouped_points, _ = self.neighbor_normal(grouped_xyz, xyz.permute(0,2,1))
+        grouped_points = grouped_points.permute(0,3,1,2).max(dim=-1, keepdim=False)[0]
+
+        point_feature = torch.cat((x, grouped_points), dim=-2)
+        return point_feature, idx
 class SGPool(nn.Module):
     def __init__(self, npoint, radius, k, in_channels, bias=True, activation='leakyrelu'):
         super(SGPool, self).__init__()
         self.npoint, self.radius, self.k, self.in_channels= npoint, radius, k, in_channels
         # self.conv = Conv1dBR(in_channels, in_channels, bias, activation)
-        self.resconv = LocalExtraction(in_channels*2, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
-        self.neighbor_normal = neighbor_normal(in_channels, 32, npoint ,k)
+        # self.resconv = LocalExtraction(in_channels*2, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
+        # self.neighbor_normal = neighbor_normal(in_channels, 32, npoint ,k)
     def forward(self, xyz, features):
-        sub_xyz, neighbor_features, new_points = \
-            sample_and_group(self.npoint, self.radius, self.k, xyz, features) # [B, npoint, nsample, D]
-        # print(neighbor_features.shape)
-        # print(new_points.shape)
-        # 
-        grouped_points,points = self.neighbor_normal(neighbor_features, new_points)
-        # os._exit(0)
-        feature = torch.cat((grouped_points, points), dim=-1).permute(0, 1, 3, 2).contiguous()
+        fps_idx=farthest_point_sample(xyz, self.npoint)
+        new_xyz = index_points(xyz, fps_idx).transpose(1, 2)
+        new_features = index_points(features, fps_idx).transpose(1, 2)
+        # sub_xyz, neighbor_features, new_points = \
+        #     sample_and_group(self.npoint, self.radius, self.k, xyz, features) # [B, npoint, nsample, D]
+        # # print(neighbor_features.shape)
+        # # print(new_points.shape)
+        # # 
+        # grouped_points,points = self.neighbor_normal(neighbor_features, new_points)
+        # # os._exit(0)
+        # feature = torch.cat((grouped_points, points), dim=-1).permute(0, 1, 3, 2).contiguous()
 
 
-        neighbor_features = self.resconv(feature) # [B*npoint, D, nsample]
-        neighbor_features = neighbor_features\
-            .view(-1, self.npoint, self.in_channels, self.k).permute(0, 2, 1, 3).contiguous()
+        # neighbor_features = self.resconv(feature) # [B*npoint, D, nsample]
+        # neighbor_features = neighbor_features\
+        #     .view(-1, self.npoint, self.in_channels, self.k).permute(0, 2, 1, 3).contiguous()
 
-        sub_features = F.max_pool2d(neighbor_features, kernel_size=[1, self.k])  # bs, c, n, 1
-        sub_features = torch.squeeze(sub_features, -1)  # bs, c, n
-        return sub_xyz.transpose(1, 2), sub_features
-
+        # sub_features = F.max_pool2d(neighbor_features, kernel_size=[1, self.k])  # bs, c, n, 1
+        # sub_features = torch.squeeze(sub_features, -1)  # bs, c, n
+        return new_xyz,new_features
 class LPFA(nn.Module):
     def __init__(self, in_channels, out_channel,npoint, k, mlp_num=2):
         super(LPFA, self).__init__()
@@ -323,16 +409,42 @@ class LPFA(nn.Module):
 
         # feature = F.leaky_relu(edge_feature + point_feature, 0.2)
         return feature #bs, c, n, k
+
+class GGraph(nn.Module):
+    def __init__(self, npoint, radius, k, in_channels, bias=True, activation='leakyrelu'):
+        super(GGraph, self).__init__()
+        self.k,self.npoint, self.radius,  self.in_channels=k, npoint, radius, in_channels
+        # self.conv = Conv1dBR(in_channels, in_channels, bias, activation)
+        # self.resconv = LocalExtraction(in_channels*2, in_channels, blocks=2, k=k, res_expansion=1,bias=bias,activation=activation)
+        self.neighbor_normal = neighbor_normal1(in_channels, npoint ,k)
+    def forward(self, xyz, features,idx = None):
+        # grouped_xyz,_ = group_no_sample(xyz, self.k, idx=idx) # (b, num, k, dim)
+        if idx is None:
+            idx = knn(xyz, self.k)[:,:,:self.k] # 静态图
+        # idx = knn(features, self.k)[:,:,:self.k] # 动态图
+        grouped_feature = index_points(features.permute(0,2,1), idx) # (b, num, k, dim)
+        # print(grouped_feature.shape)
+        grouped_feature, features = self.neighbor_normal(grouped_feature, features)
+        feature = torch.cat((grouped_feature, features), dim=-1)
+        # print(feature.shape)
+        return feature# (b, num, k, dim)
+
 class BackboneFeature(nn.Module):
-    def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='leakyrelu'):
+    def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='relu'):
         super(BackboneFeature, self).__init__()
+    
         self.in_channels,self.npoint,self.k = in_channels,npoint,k
         self.output_channels = output_channels
         planes = in_channels // bottleneck_ratio
-        self.SGPool = SGPool(npoint, radius, k, in_channels, bias=False, activation=activation)
-        self.conv1 = GlobalExtraction(in_channels, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
+        self.sgpool = SGPool(npoint, radius, k, in_channels, bias=False, activation=activation)
+        self.ggraph = GGraph(npoint, radius, k, in_channels, bias=False, activation='leakyrelu')
 
-        self.lpfa = LPFA(planes, planes, npoint=npoint, k=k, mlp_num=mlp_num)
+        self.Localextraction = LocalExtraction(in_channels*2, planes, blocks=2, k =20, res_expansion=1,bias=False,activation='relu')
+
+
+        self.globalExtraction = GlobalExtraction(planes, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
+
+        # self.lpfa = LPFA(planes, planes, npoint=npoint, k=k, mlp_num=mlp_num)
 
         self.conv2 = Conv1dBR(planes, output_channels, bias=False, activation=None)
 
@@ -341,17 +453,16 @@ class BackboneFeature(nn.Module):
         self.relu = get_act(activation)
         
 
-    def forward(self, xyz, x):
+    def forward(self, xyz, x,idx= None):
         # max pool
-        if xyz.size(-1) != self.npoint:#(b,d,n)
-            xyz, x = self.SGPool(xyz.transpose(1, 2).contiguous(), x.transpose(1, 2).contiguous())# bs, d, n
+        if xyz.size(-1) != self.npoint: #(b,d,n)
+            xyz, x = self.sgpool(xyz.transpose(1, 2), x.transpose(1, 2))# bs, d, n # TODO :取代最远点采样
         shortcut = x
-        x = self.conv1(x)  # bs, d', n
 
-        idx = knn(xyz, self.k)[:,:,:self.k] # 静态图
+        x = self.ggraph(xyz, x, idx) # 生成图 # (b, num, k, dim)
+        x = self.Localextraction(x) #
+        x = self.globalExtraction(x)
 
-        x = self.lpfa(x, xyz, idx=idx)#bs, c', n, k
-        # print(x.shape)
         x = self.conv2(x)  # bs, c, n
         # os._exit(1)
         if self.in_channels != self.output_channels:
@@ -363,7 +474,8 @@ class BackboneFeature(nn.Module):
 class Module(nn.Module):
     def __init__(self, cfg=None, num_classes=40, k=20):
         super(Module, self).__init__()
-        self.input_embedding = Input_embedding(in_channels=3, out_channels=64, batch_size=cfg.batch_size,npoint=1024, k=k, mlp_num=1)
+        self.input_embedding = Input_embedding(in_channels=3, out_channels=64, k=k, mlp_num=1)
+        
         # self.lpfa = LPFA(9, additional_channel, k=k, mlp_num=1, initial=True)
         # encoder
         self.cic11 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=128, bottleneck_ratio=2, mlp_num=1)
@@ -398,9 +510,9 @@ class Module(nn.Module):
     def forward(self, xyz):
         # print(xyz.shape)
         xyz = xyz.permute(0,2,1).contiguous()
-        points = self.input_embedding(xyz)
+        points ,idx= self.input_embedding(xyz)
 
-        l1_xyz, l1_points = self.cic11(xyz, points)
+        l1_xyz, l1_points = self.cic11(xyz, points,idx)
         # l1_xyz, l1_points = self.cic12(l1_xyz, l1_points)
 
         l2_xyz, l2_points = self.cic21(l1_xyz, l1_points)
@@ -422,85 +534,7 @@ class Module(nn.Module):
         x = self.classification(x)
         return x
 
-class xyz_normal(nn.Module):
-    def __init__(self,b,dim,num):#[b , dim, num]
-        super(xyz_normal, self).__init__()
-        self.b,self.d,self.num=b,dim,num
-        self.ln = nn.LayerNorm(dim*num, elementwise_affine=False)
-        
-    def forward(self, x):#[b , dim, num]
-        x = x - torch.mean(x, dim=-1, keepdim=True)
-        # print(x.shape)
-        # os._exit(0)
-        x = x.view(self.b,-1)
-        x = self.ln(x).view(self.b,self.d,self.num)
-        return x
 
-class neighbor_normal(nn.Module):
-    def __init__(self, in_channels,b, num ,k):#[b , num,dim, k]
-        super(neighbor_normal, self).__init__()
-        self.b,self.num,self.k=b,num,k
-       
-        self.affine_alpha = nn.Parameter(torch.ones([1, 1, 1, in_channels]))
-        self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, in_channels]))
-        
-    def forward(self, grouped_points, points):#[b,num,k,dim]  [b, num, dim]
-        points = points.view(self.b, self.num, 1, -1).expand(-1, -1, self.k, -1)  
-        # print(points.shape)
-        # os._exit(0)
-        res = grouped_points-points
-        std = torch.std(res.reshape(self.b,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
-        grouped_points = res/(std + 1e-5)
-        grouped_points = self.affine_alpha*grouped_points + self.affine_beta
-        return grouped_points,points#[b , num,dim, k]
-
-class Input_embedding(nn.Module):  
-    def __init__(self, in_channels, out_channels, batch_size,npoint, k, mlp_num, bias=False,activation='leakyrelu'):
-        super(Input_embedding, self).__init__()
-        self.k = k
-        self.xyznormal = xyz_normal(batch_size ,in_channels, npoint)
-        self.neighbor_normal = neighbor_normal(in_channels,batch_size, npoint ,k)
-
-        self.conv = []
-        in_channels=in_channels*2
-        for _ in range(mlp_num):
-            self.conv.append(Conv1dBR(in_channels, out_channels, bias=bias, activation=activation))
-            in_channels = out_channels
-        self.conv = nn.Sequential(*self.conv) 
-        self.device = torch.device('cuda')
-
-    def forward(self, xyz, idx=None):
-        batch_size, _, num_points = xyz.shape
-        # print(batch_size)
-        # os._exit(0)
-        if idx is None:
-            idx = knn(xyz, k=self.k)[:,:,:self.k]  # (batch_size, num_points, k)
-        
-        
-        idx_base = torch.arange(0, batch_size, device=self.device).view(-1, 1, 1) * num_points
-        idx = idx + idx_base
-        idx = idx.view(-1)
-
-        xyz = self.xyznormal(xyz)
-        xyz = xyz.transpose(2, 1).contiguous() # bs, n, 3
-        point_feature = xyz.view(batch_size * num_points, -1)[idx, :]
-        point_feature = point_feature.view(batch_size, num_points, self.k, -1)  # bs, n, k, 3
-        
-        grouped_points,points = self.neighbor_normal(point_feature, xyz)
-
-        # points = xyz.view(batch_size, num_points, 1, -1).expand(-1, -1, self.k, -1)  # bs, n, k, 3
-        point_feature = torch.cat((
-            points, grouped_points # TODO :距离，数据标准化
-            ), dim=3).permute(0, 1, 3, 2).contiguous().view(batch_size*num_points, -1, self.k)
-
-        # point_feature = torch.cat((
-        #     points, point_feature, points - point_feature # TODO :距离，数据标准化
-        #     ), dim=3).permute(0, 1, 3, 2).contiguous().view(batch_size* num_points, -1, self.k)
-        
-        # x = self.group_feature(x, xyz, idx)
-        x = self.conv(point_feature).view(batch_size, num_points, -1, self.k).permute(0,2,1,3)
-        x = x.max(dim=-1, keepdim=False)[0]
-        return x
 
 if __name__ == '__main__':
     import sys
