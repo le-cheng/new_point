@@ -24,7 +24,9 @@ parser.add_argument('-c', '--config', default='configs/config.yaml', type=str, m
 parser.add_argument('--resume', default=None, type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--exp_name', default=None, type=str, metavar='PATH',
-                    help='exp_name')     
+                    help='exp_name')
+parser.add_argument('--model', type=str, help='model_name')        
+                    
 parser.add_argument('--seed', type=int, help='random seed')      
 
 def main():
@@ -33,8 +35,10 @@ def main():
     cfg = read_yaml(args.config)
     if args.exp_name is not None:
         cfg.exp_name = args.exp_name
+    if args.model is not None:
+        cfg.model_name = args.model
     if cfg.data_name == 'scanobjectnn':
-        cfg.num_class = 15
+        cfg.num_classes = 15
     
     # prepare file structures
     time_str = time.strftime("%Y-%m-%d_%H:%M_", time.localtime())
@@ -59,7 +63,7 @@ def main():
     os.system('cp '+ __file__ + ' ' + backup_dir + '/train.py.backup')
     os.system('cp models/{}.py '.format(cfg.model_name) + backup_dir + '/model.py.backup')
     os.system('cp models/{}.py models/{}.py'.format(cfg.model_name, cfg.model_copy_name))
-    os.system('cp '+ cfg.config_dir + ' ' + backup_dir + '/config.yaml.backup')
+    os.system('cp '+ args.config + ' ' + backup_dir + '/config.yaml.backup')
 
 
     logger = get_logger(os.path.join(root_dir, cfg.logger_filename))
@@ -75,14 +79,13 @@ def main():
     # logger.info("Cudnn Version: {}".format(torch.backends.cudnn.version()))
     logger.info("use Model: [ {} ]".format(cfg.model_name))
     logger.info("use Data: [ {} ]".format(cfg.data_name))
-    logger.info("data class number: [ {} ]".format(cfg.num_class))
+    logger.info("data class number: [ {} ]".format(cfg.num_classes))
     
     '''init'''
     if args.seed is not None:
         seed = args.seed
     else:
         seed = torch.randint(1, 10000,(1,))
-    
     # seed = 9523
     logger.info("Seed: [ {} ]".format(seed))
     np.random.seed(seed)
@@ -163,7 +166,7 @@ def main():
         scheduler.step()
 
 
-        test_acc, class_acc, test_loss= test(model, Test_DataLoader, cfg.num_class, lossfn)
+        test_acc, class_acc, test_loss= test(model, Test_DataLoader, cfg.num_classes, lossfn)
         # print(list(model.state_dict().keys()))
         # raise ValueError
         if (class_acc >= best_class_acc):

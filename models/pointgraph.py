@@ -2,6 +2,7 @@
 resconv3.16
 """
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -115,13 +116,11 @@ def sample_and_group(npoint, radius, k, xyz, points, knn=True):
         groupe_idx = query_ball_point(radius, k, xyz, new_xyz)
     new_grouped_points = index_points(points, groupe_idx) # [B, npoint, nsample, D]
     return new_xyz, new_grouped_points, new_points
-
 def group_no_sample(points, k, idx=None):
     if idx is None:
         idx = knn(points, k=k)[:,:,:k]  # (batch_size, num_points, k)
     grouped_feature = index_points(points.permute(0,2,1), idx)
     return grouped_feature, idx
-
 def get_act(activation):
     if activation.lower() == 'gelu':
         return nn.GELU()
@@ -205,7 +204,6 @@ class LocalExtraction(nn.Module):
         x = F.adaptive_max_pool1d(x, 1)
         x = x.view(b, num, -1).permute(0, 2, 1)
         return x
-
 class GlobalExtraction(nn.Module):
     def __init__(self, in_channels, out_channels, blocks=2, res_expansion=1, bias=True, activation='relu'):
         """
@@ -268,7 +266,8 @@ class neighbor_normal1(nn.Module):
     def forward(self, grouped_points, points):#[b,num,k,dim]  [b, num, dim]
         # b, _, num_points = points.shape
         b, num, k,dim= grouped_points.shape
-        points = points.view(b, self.num, 1, -1).expand(-1, -1, self.k, -1)  
+        points = points.permute(0,2,1)
+        points = points.view(b, num, 1, -1).expand(-1, -1, self.k, -1)  
         # print(points.shape)
         # os._exit(0)
         res = grouped_points-points
@@ -306,12 +305,8 @@ class Input_embedding(nn.Module):
     def __init__(self, in_channels, out_channels,k, mlp_num, bias=False,activation='leakyrelu'):
         super(Input_embedding, self).__init__()
         self.k = k
-        out_channels=out_channels//2
-        # self.xyznormal = xyz_normal(batch_size ,in_channels, npoint)# TODO 测试xyznorm
-        self.neighbor_normal = neighbor_normal(in_channels,out_channels,bias=bias)
 
         self.conv = []
-        
         for _ in range(mlp_num):
             self.conv.append(Conv1dBR(in_channels, out_channels, bias=bias, activation=activation))
             in_channels = out_channels
@@ -319,13 +314,7 @@ class Input_embedding(nn.Module):
 
     def forward(self, xyz, idx=None):
         x = self.conv(xyz) # (b, dim, num)
-        grouped_xyz, idx = group_no_sample(xyz, self.k, idx=idx) # (b, num, k, 3)
-
-        grouped_points, _ = self.neighbor_normal(grouped_xyz, xyz.permute(0,2,1))
-        grouped_points = grouped_points.permute(0,3,1,2).max(dim=-1, keepdim=False)[0]
-
-        point_feature = torch.cat((x, grouped_points), dim=-2)
-        return point_feature, idx
+        return x
 class SGPool(nn.Module):
     def __init__(self, npoint, radius, k, in_channels, bias=True, activation='leakyrelu'):
         super(SGPool, self).__init__()
@@ -354,85 +343,6 @@ class SGPool(nn.Module):
         # sub_features = F.max_pool2d(neighbor_features, kernel_size=[1, self.k])  # bs, c, n, 1
         # sub_features = torch.squeeze(sub_features, -1)  # bs, c, n
         return new_xyz,new_features
-class LPFA(nn.Module):
-    def __init__(self, in_channels, out_channel,npoint, k, mlp_num=2):
-        super(LPFA, self).__init__()
-        self.k = k
-        self.device = torch.device('cuda')
-        self.xyz2feature = nn.Sequential(
-                    nn.Conv2d(9, in_channels, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(in_channels))
-
-        in_channels = in_channels *2
-        self.mlp = []
-        for _ in range(mlp_num):
-            self.mlp.append(nn.Sequential(nn.Conv2d(in_channels, out_channel, 1, bias=False),
-                                 nn.BatchNorm2d(out_channel),
-                                 nn.LeakyReLU(0.2)))
-            in_channels = out_channel
-        self.mlp = nn.Sequential(*self.mlp)     
-
-        self.neighbor_normal = neighbor_normal(in_channels, 32, npoint ,k)
-
-        # self.affine_alpha = nn.Parameter(torch.ones([1,1,1,in_channel]))
-        # self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1,in_channel]))   
-
-    def forward(self, x, xyz, idx=None): # x [b, d, n] xyz [b,3,n]
-        x = self.group_feature(x, xyz, idx)
-        x = self.mlp(x) # TODO :local
-
-        # if self.initial:
-        x = x.max(dim=-1, keepdim=False)[0]
-        # else:
-        # TODO : 测试最大池化
-        # x = x.mean(dim=-1, keepdim=False)
-        return x
-
-    def group_feature(self, x, xyz, idx):
-        batch_size, num_dims, num_points = x.size()
-
-        if idx is None:
-            idx = knn(xyz, k=self.k)[:,:,:self.k]  # (batch_size, num_points, k)
-
-        idx_base = torch.arange(0, batch_size, device=self.device).view(-1, 1, 1) * num_points
-        idx = idx + idx_base
-        idx = idx.view(-1)
-
-        # xyz = xyz.transpose(2, 1).contiguous() # bs, n, 3
-        # point_feature = xyz.view(batch_size * num_points, -1)[idx, :]
-        # point_feature = point_feature.view(batch_size, num_points, self.k, -1)  # bs, n, k, 3
-        # points = xyz.view(batch_size, num_points, 1, 3).expand(-1, -1, self.k, -1)  # bs, n, k, 3
-
-        # point_feature = torch.cat((points, point_feature, point_feature - points),
-        #                         dim=3).permute(0, 3, 1, 2).contiguous()
-
-
-        x = x.transpose(2, 1).contiguous() # bs, n, d
-        feature = x.view(batch_size * num_points, -1)[idx, :]
-        feature = feature.view(batch_size, num_points, self.k, num_dims)  #bs, n, k, d
-        
-        grouped_points,points = self.neighbor_normal(feature, x)
-        
-        # x = x.view(batch_size, num_points, 1, num_dims)
-        # # edge_feature = feature - x
-
-        # # ----------------------------------------------------------------
-        # std = torch.std((feature-x).reshape(batch_size,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
-        # # print(std.shape)
-        # # print(std)
-        # grouped_points = (feature-x)/(std + 1e-5)
-        # grouped_points = self.affine_alpha*grouped_points + self.affine_beta
-        # os._exit(0)
-        feature = torch.cat((grouped_points, points), dim=-1).permute(0, 3, 1, 2).contiguous()
-        # TODO :边信息和节点信息是否需要归一化
-        # TODO :是否需要带上point_feature
-        #point_feature = torch.cat((feature - x, feature, point_feature), dim=-1)
-
-        # edge_feature = edge_feature.permute(0, 3, 1, 2).contiguous()
-        # point_feature = self.xyz2feature(point_feature)  #bs, c, n, k
-
-        # feature = F.leaky_relu(edge_feature + point_feature, 0.2)
-        return feature #bs, c, n, k
 
 class GGraph(nn.Module):
     def __init__(self, npoint, radius, k, in_channels, bias=True, activation='leakyrelu'):
@@ -446,7 +356,7 @@ class GGraph(nn.Module):
         if idx is None:
             idx = knn(xyz, self.k)[:,:,:self.k] # 静态图
         # idx = knn(features, self.k)[:,:,:self.k] # 动态图
-        grouped_feature = index_points(features.permute(0,2,1), idx) # (b, num, k, dim)
+        grouped_feature = index_points(features.permute(0,2,1).contiguous(), idx) # (b, num, k, dim)
         # print(grouped_feature.shape)
         grouped_feature, features = self.neighbor_normal(grouped_feature, features)
         feature = torch.cat((grouped_feature, features), dim=-1)
@@ -454,23 +364,23 @@ class GGraph(nn.Module):
         return feature# (b, num, k, dim)
 
 class BackboneFeature(nn.Module):
-    def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='relu'):
+    def __init__(self, npoint, in_channels, output_channels, radius, k, bottleneck_ratio=2, mlp_num=2, activation='relu',num_heads=8,att_size=64):
         super(BackboneFeature, self).__init__()
     
         self.in_channels,self.npoint,self.k = in_channels,npoint,k
         self.output_channels = output_channels
         planes = in_channels // bottleneck_ratio
         self.sgpool = SGPool(npoint, radius, k, in_channels, bias=False, activation=activation)
+        
+        
         self.ggraph = GGraph(npoint, radius, k, in_channels, bias=False, activation='leakyrelu')
 
-        self.Localextraction = LocalExtraction(in_channels*2, planes, blocks=2, k =20, res_expansion=1,bias=False,activation='relu')
+        self.Localextraction = LocalExtraction(in_channels*2, output_channels, blocks=1, k =20, res_expansion=1,bias=False,activation='relu')
+        self.transformer = EncoderLayer(in_channels=output_channels, num_heads=num_heads, att_size=att_size, n_point=npoint, ffn_size=att_size, dropout_rate=0.1, attention_dropout_rate=0.1)
 
+        # self.globalExtraction = GlobalExtraction(planes, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
 
-        self.globalExtraction = GlobalExtraction(planes, planes, blocks=2, res_expansion=1, bias=False, activation=activation)
-
-        # self.lpfa = LPFA(planes, planes, npoint=npoint, k=k, mlp_num=mlp_num)
-
-        self.conv2 = Conv1dBR(planes, output_channels, bias=False, activation=None)
+        # self.conv2 = Conv1dBR(planes, output_channels, bias=False, activation=None)
 
         if in_channels != output_channels:
             self.shortcut = Conv1dBR(in_channels, output_channels, bias=False, activation=None)
@@ -485,30 +395,59 @@ class BackboneFeature(nn.Module):
 
         x = self.ggraph(xyz, x, idx) # 生成图 # (b, num, k, dim)
         x = self.Localextraction(x) #
-        x = self.globalExtraction(x)
+        x = self.transformer(x)
+        # x = self.globalExtraction(x)
 
-        x = self.conv2(x)  # bs, c, n
+        # x = self.conv2(x)  # bs, c, n
         # os._exit(1)
+
         if self.in_channels != self.output_channels:
             shortcut = self.shortcut(shortcut)
 
         x = self.relu(x + shortcut)
         return xyz, x
 
+class TransformerBlock(nn.Module):
+    def __init__(self, d_points, d_model, k=16) -> None:
+        super().__init__()
+        # self.fc1 = nn.Linear(d_points, d_model) # d_model=512, d_points = 32  换nn.Conv1d
+        self.w_qs = nn.Linear(d_points, d_model, bias=False)
+        self.w_ks = nn.Linear(d_points, d_model, bias=False)
+        self.w_vs = nn.Linear(d_points, d_model, bias=False)
+        self.softmax = nn.Softmax(dim=-1)
+        self.fc2 = nn.Linear(d_model, d_points)
+        self.bn1 = nn.BatchNorm1d(d_points)
+        self.relu = nn.ReLU()
+    # xyz: b x n x 3, features: b x n x f
+    def forward(self, features):
+        pre = features # 64
+        x = features
+        q, k, v = self.w_qs(x), self.w_ks(x), self.w_vs(x)
+        kT = k.transpose(-1, -2)
+        # attn = self.fc_gamma(torch.matmul(q,kT))
+        attn = torch.matmul(q,kT)
+        attn = self.softmax(attn/np.sqrt(k.size(-1)))  # b x n x k x f 
+        res = torch.matmul(attn, v)
+
+        res = F.leaky_relu(self.fc2(res).permute(0, 2, 1).permute(0, 2, 1), negative_slope=0.2)
+        # res = self.fc2(res) + pre
+        res = res + pre
+        return res
+        
 class Module(nn.Module):
     def __init__(self, cfg=None, k=20):
         super(Module, self).__init__()
-        self.input_embedding = Input_embedding(in_channels=3, out_channels=64, k=k, mlp_num=1)
+        self.input_embedding = Input_embedding(in_channels=3, out_channels=32, k=k, mlp_num=1)
         
         # self.lpfa = LPFA(9, additional_channel, k=k, mlp_num=1, initial=True)
         # encoder
-        self.cic11 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=128, bottleneck_ratio=2, mlp_num=1)
+        self.cic11 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=32, output_channels=64, bottleneck_ratio=2, mlp_num=1)
         # self.cic12 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=64, bottleneck_ratio=4, mlp_num=1)
         
-        self.cic21 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=128, output_channels=256, bottleneck_ratio=2, mlp_num=1)
+        self.cic21 = BackboneFeature(npoint=1024, radius=0.05, k=k, in_channels=64, output_channels=128, bottleneck_ratio=2, mlp_num=1)
         # self.cic22 = BackboneFeature(npoint=1024, radius=0.1, k=k, in_channels=128, output_channels=128, bottleneck_ratio=4, mlp_num=1)
 
-        self.cic31 = BackboneFeature(npoint=256, radius=0.1, k=k, in_channels=256, output_channels=256, bottleneck_ratio=2, mlp_num=1)
+        self.cic31 = BackboneFeature(npoint=256, radius=0.1, k=k, in_channels=128, output_channels=256, bottleneck_ratio=2, mlp_num=1)
         # self.cic32 = BackboneFeature(npoint=256, radius=0.2, k=k, in_channels=256, output_channels=256, bottleneck_ratio=4, mlp_num=1)
 
         self.cic41 = BackboneFeature(npoint=256, radius=0.2, k=k, in_channels=256, output_channels=512, bottleneck_ratio=2, mlp_num=1)
@@ -533,10 +472,10 @@ class Module(nn.Module):
 
     def forward(self, xyz):
         # print(xyz.shape)
-        xyz = xyz.permute(0,2,1).contiguous()
-        points ,idx= self.input_embedding(xyz)
+        xyz = xyz.permute(0,2,1)
+        points = self.input_embedding(xyz)
 
-        l1_xyz, l1_points = self.cic11(xyz, points,idx)
+        l1_xyz, l1_points = self.cic11(xyz, points)
         # l1_xyz, l1_points = self.cic12(l1_xyz, l1_points)
 
         l2_xyz, l2_points = self.cic21(l1_xyz, l1_points)
@@ -559,6 +498,109 @@ class Module(nn.Module):
         return x
 
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, in_channels, num_heads, att_size, attention_dropout_rate):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.att_size = att_size 
+        self.qkv_size = att_size // num_heads
+        # att_size = self.att_size
+        self.scale = self.qkv_size ** -0.5
+        
+        self.linear_q = nn.Conv1d(in_channels, att_size , kernel_size=1, bias=False)
+        self.linear_k = nn.Conv1d(in_channels, att_size , kernel_size=1, bias=False)
+        self.linear_v = nn.Conv1d(in_channels, att_size , kernel_size=1, bias=False)
+
+        # self.linear_q = nn.Linear(hidden_size, num_heads * att_size, bias=False)
+        # self.linear_k = nn.Linear(hidden_size, num_heads * att_size, bias=False)
+        # self.linear_v = nn.Linear(hidden_size, num_heads * att_size, bias=False)
+        self.att_dropout = nn.Dropout(attention_dropout_rate)
+
+        self.output_layer = nn.Sequential(nn.Conv1d(self.att_size , in_channels, kernel_size=1, bias=False),
+                                          nn.BatchNorm1d(in_channels),
+                                          nn.LeakyReLU(negative_slope=0.2))
+        
+        # self.output_layer = nn.Linear(num_heads * att_size, hidden_size)
+    def forward(self, q, k, v, attn_bias=None, mask=None):
+        orig_q_size = q.size()
+        batch_size = q.size(0)
+        # print(orig_q_size)
+        # head_i = Attention(Q(W^Q)_i, K(W^K)_i, V(W^V)_i)
+        q = self.linear_q(q).view(batch_size, self.num_heads, self.qkv_size, -1)
+        k = self.linear_k(k).view(batch_size, self.num_heads, self.qkv_size, -1)
+        v = self.linear_v(v).view(batch_size, self.num_heads, self.qkv_size, -1)
+
+        q = q.transpose(3, 2)  
+        v = v.transpose(3, 2)     
+        # Scaled Dot-Product Attention.
+        # Attention(Q, K, V) = softmax((QK^T)/sqrt(d_k))V
+        # q = q * self.scale
+        attn = torch.matmul(q, k)  # [b, h, q_len, k_len]
+        attn = attn * self.scale
+
+        if mask is not None:
+            # 屏蔽不想要的输出
+            attn = attn.masked_fill(mask == 0, -1e6)
+        if attn_bias is not None:
+            attn = attn + attn_bias
+
+        x = torch.softmax(attn, dim=-1)
+        x = self.att_dropout(x)
+        x = x.matmul(v)  # [b, h, q_len, attn]
+
+        x = x.transpose(3, 2).contiguous()  # [b, q_len, h, attn]
+        x = x.view(batch_size, self.att_size, -1)
+
+        x = self.output_layer(x)
+
+        assert x.size() == orig_q_size
+        return x
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, hidden_size, ffn_size, dropout_rate):
+        super(FeedForwardNetwork, self).__init__()
+
+        # self.layer1 = nn.Linear(hidden_size, ffn_size)
+        self.layer1 = nn.Conv1d(hidden_size, ffn_size , kernel_size=1)
+        # self.gelu = nn.GELU()
+        self.LeakyReLU = nn.LeakyReLU(negative_slope=0.2)
+        self.layer2 = nn.Conv1d(ffn_size, hidden_size , kernel_size=1)
+        # self.layer2 = nn.Linear(ffn_size, hidden_size)
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.LeakyReLU(x)
+        x = self.layer2(x)
+        return x
+
+class EncoderLayer(nn.Module):
+    def __init__(self, in_channels, num_heads, att_size, n_point, ffn_size, dropout_rate, attention_dropout_rate):
+        super(EncoderLayer, self).__init__()
+        assert att_size >= 64
+        assert att_size % 8 == 0
+
+        # self.self_attention_norm = nn.LayerNorm([hidden_size, n_points])
+        self.self_attention = MultiHeadAttention(in_channels, num_heads, att_size, attention_dropout_rate)
+        self.self_attention_dropout = nn.Dropout(dropout_rate)
+
+        # self.ffn_norm = nn.LayerNorm([in_channels, n_point])
+        # self.ffn = FeedForwardNetwork(in_channels, ffn_size, dropout_rate)
+        # self.ffn_dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x, attn_bias=None):
+        # x = x.permute(0, 2, 1).contiguous()
+        # y = self.self_attention_norm(x)
+        y = x
+        y = self.self_attention(y, y, y, attn_bias)
+        y = self.self_attention_dropout(y)
+        x = x + y
+        # norm(x)
+
+        # y = self.ffn_norm(x)
+        # y = x
+        # y = self.ffn(y)
+        # y = self.ffn_dropout(y)
+        # x = x + y
+        # x = x.permute(0, 2, 1).contiguous()
+        return x
 
 if __name__ == '__main__':
     import sys

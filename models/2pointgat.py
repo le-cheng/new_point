@@ -278,30 +278,6 @@ class neighbor_normal1(nn.Module):
         grouped_points = res/(std + 1e-5) # TODO :似乎要好好研究一下 GN
         grouped_points = self.affine_alpha*grouped_points + self.affine_beta
         return grouped_points,points#[b , num,k,dim]
-class Input_embedding1(nn.Module):  
-    def __init__(self, in_channels, out_channels,k, mlp_num, bias=False,activation='leakyrelu'):
-        super(Input_embedding1, self).__init__()
-        self.k = k
-        out_channels=out_channels//2
-        # self.xyznormal = xyz_normal(batch_size ,in_channels, npoint)# TODO 测试xyznorm
-        self.neighbor_normal = neighbor_normal(in_channels,out_channels,bias=bias)
-
-        self.conv = []
-        
-        for _ in range(mlp_num):
-            self.conv.append(Conv1dBR(in_channels, out_channels, bias=bias, activation=activation))
-            in_channels = out_channels
-        self.conv = nn.Sequential(*self.conv) 
-
-    def forward(self, xyz, idx=None):
-        x = self.conv(xyz) # (b, dim, num)
-        grouped_xyz, idx = group_no_sample(xyz, self.k, idx=idx) # (b, num, k, 3)
-
-        grouped_points, _ = self.neighbor_normal(grouped_xyz, xyz.permute(0,2,1))
-        grouped_points = grouped_points.permute(0,3,1,2).max(dim=-1, keepdim=False)[0]
-
-        point_feature = torch.cat((x, grouped_points), dim=-2)
-        return point_feature, idx
 class Input_embedding(nn.Module):  
     def __init__(self, in_channels, out_channels,k, mlp_num, bias=False,activation='leakyrelu'):
         super(Input_embedding, self).__init__()
@@ -496,7 +472,7 @@ class BackboneFeature(nn.Module):
         return xyz, x
 
 class Module(nn.Module):
-    def __init__(self, cfg=None, k=20):
+    def __init__(self, cfg=None, num_classes=40, k=20):
         super(Module, self).__init__()
         self.input_embedding = Input_embedding(in_channels=3, out_channels=64, k=k, mlp_num=1)
         
@@ -524,7 +500,7 @@ class Module(nn.Module):
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True), # inplace = True,会改变输入数据的值,节省反复申请与释放内存的空间与时间,只是将原来的地址传递,效率更好
             nn.Dropout(p=0.5),
-            nn.Linear(256, cfg.num_classes)
+            nn.Linear(256, num_classes)
             )
         # self.conv1 = nn.Linear(1024 * 2, 512, bias=False)
         # self.conv2 = nn.Linear(512, num_classes)
